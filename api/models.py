@@ -214,7 +214,7 @@ class PasswordResetCode(models.Model):
     def __str__(self):
         return f"رمز إعادة تعيين لـ {self.email}"
 
-# جدول للمستخدمين بيعرض اسمو عنوانو رقم الهاتف... (للمشرفين)
+# جدول البيانات الإضافية لجميع المستخدمين (الاسم، الهاتف، العنوان، القسم، تاريخ الميلاد)
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='members')
