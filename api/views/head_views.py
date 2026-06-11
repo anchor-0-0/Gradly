@@ -1,0 +1,301 @@
+from rest_framework import viewsets,generics, permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.decorators import action
+from django.shortcuts import get_object_or_404
+from django.contrib.auth.models import User
+from django.contrib.auth.models import User
+from ..models import Notification, Project,DefenseCommittee , Evaluation, SystemSettings, Department
+from ..serializers import ProjectSerializer, DefenseCommitteeSerializer, SystemSettingsSerializer, DepartmentSerializer, NotificationSerializer
+from django.db.models import  Avg
+
+
+# واجهة التحكم باللجان (خاصة برئيس القسم)
+# عرض/إنشاء/تعديل/حذف لجان المناقشة
+# - رئيس القسم: يشوف كل اللجان ويقدر ينشئ ويعدل ويحذف ويعتمد النتيجة
+# - الدكتور (عضو لجنة): يشوف بس اللجان اللي هو عضو فيها
+# عند إنشاء لجنة: يرسل إشعار للطلاب (تاريخ+وقت+مكان+أسماء اللجنة) وللدكاترة (تم إضافتك كلجنة)
+class DefenseCommitteeViewSet(viewsets.ModelViewSet):
+    queryset = DefenseCommittee.objects.all()
+    serializer_class = DefenseCommitteeSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        # رئيس القسم يشوف الكل، الدكتور يشوف لجانه فقط
+        if self.request.user.is_superuser:
+            return DefenseCommittee.objects.all()
+        return DefenseCommittee.objects.filter(examiners=self.request.user)
+
+    def perform_create(self, serializer):
+        # إنشاء لجنة جديدة: شرط أن يكون مشرف المشروع ضمن أعضاء اللجنة
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("عذراً هذه الصلاحية لرئيس القسم فقط")
+        project = serializer.validated_data['project']
+        examiners = serializer.validated_data.get('examiners', [])
+        if project.supervisor not in examiners:
+            raise PermissionDenied("يجب أن يكون مشرف المشروع ضمن لجنة المناقشة")
+        serializer.save()
+
+        # إشعار للطلاب بموعد المناقشة
+        examiners_names = [u.username for u in examiners]
+        committee_date = serializer.validated_data['date']
+        committee_details = (
+            f"المشروع: {project.title}\n"
+            f"التاريخ: {committee_date.strftime('%Y-%m-%d')}\n"
+            f"الوقت: {committee_date.strftime('%H:%M')}\n"
+            f"المكان: {serializer.validated_data['location']}\n"
+            f"أعضاء اللجنة: {', '.join(examiners_names)}"
+        )
+        for student in project.students.all():
+            Notification.objects.create(
+                recipient=student,
+                project=project,
+                message=f"تم تحديد موعد مناقشة مشروعك\n{committee_details}"
+            )
+        # إشعار لأعضاء اللجنة (الدكاترة)
+        for examiner in examiners:
+            Notification.objects.create(
+                recipient=examiner,
+                project=project,
+                message=f"تم إضافتك كلجنة مناقشة\n{committee_details}"
+            )
+
+    def perform_update(self, serializer):
+        # تعديل لجنة موجودة (فقط لرئيس القسم)
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("عذراً هذه الصلاحية لرئيس القسم فقط")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        # حذف لجنة (فقط لرئيس القسم)
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("عذراً هذه الصلاحية لرئيس القسم فقط")
+        instance.delete()
+
+
+# -- لوحة تحكم رئيس القسم (شاشة HOD Dashboard #33) --
+# GET /api/hod/dashboard/
+# تعرض: إحصائيات (كل المشاريع، النشطة، المنجزة، اللجان) + قائمة بجميع المشاريع
+class HODDashboardView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+
+        total_projects = Project.objects.count()
+        active_projects = Project.objects.filter(status='in_progress').count()
+        completed_projects = Project.objects.filter(status='completed').count()
+        total_committees = DefenseCommittee.objects.count()
+        total_students = User.objects.filter(is_staff=False, is_superuser=False).count()
+        total_supervisors = User.objects.filter(is_staff=True).count()
+
+        # قائمة مختصرة بآخر المشاريع
+        projects = Project.objects.all().order_by('-id')[:10]
+        projects_list = [
+            {
+                'id': p.id,
+                'title': p.title,
+                'status': p.status,
+                'supervisor': p.supervisor.username if p.supervisor else None,
+                'students_count': p.students.count(),
+            }
+            for p in projects
+        ]
+
+        return Response({
+            'stats': {
+                'total_projects': total_projects,
+                'active_projects': active_projects,
+                'completed_projects': completed_projects,
+                'total_committees': total_committees,
+                'total_students': total_students,
+                'total_supervisors': total_supervisors,
+            },
+            'projects': projects_list,
+        })
+
+
+# -- إشعارات رئيس القسم (شاشة HOD Notifications #44) --
+# GET /api/hod/notifications/
+# يعرض جميع الإشعارات المرسلة إلى رئيس القسم
+class HODNotificationsView(generics.ListAPIView):
+    serializer_class = NotificationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        return Notification.objects.filter(recipient=self.request.user).order_by('-created_at')
+
+    @action(detail =True , methods = ['post'], url_path='finalize')
+    def finalize_result (self ,request ,pk=None):
+        # اعتماد نتيجة المناقشة: يحسب متوسط تقييمات الدكاترة
+        # >= 60 نجاح ويتم تخزين الدرجة في المشروع
+        # يرسل إشعار للطلاب بالنتيجة (نجاح/رسوب)
+            if not request.user.is_superuser:
+                 return Response({"error":"غير مسموح لك باعتماد النتيجة ❌"} , status=status.HTTP_403_FORBIDDEN)
+            committee = self.get_object()
+
+            result = Evaluation.objects.filter(committee_id =committee.id).aggregate(avg=Avg('grade'))
+            avg_grade = result.get('avg')
+            if avg_grade is None :
+                return Response( {
+                                 "error":"لا يوجد تقييمات مسجلة لهذه اللجنة بعد 🙂‍↔️"
+                                 } ,status=status.HTTP_400_BAD_REQUEST
+                                )
+            
+            
+            if avg_grade >=60 :
+                subject = "تهنئة بالنجاح 🎓 \n"
+                message = f"مبارك يا مهندس/ة 🥳🎉 \n نتيجتك النهائية :{avg_grade}\n نتمنى لك مستقبلاً باهراً 🫶🏻"
+            else :
+                subject = "نتائج مناقشة مشروع التخرج 🎓\n"
+                message = f"عزيزي الطالب :\n تم رصد نتيجتك {avg_grade} \n حظاً أوفر بالمرات القادمة 💔"
+
+            #ارسال النتيجة للطالب
+            project = committee.project
+            for student in project.students.all():
+                full_notification_text = f"{subject}  \n{message}"
+                Notification.objects.create(
+                    recipient = student , project=project,message = full_notification_text,is_read=False
+                )
+                project.final_grade = avg_grade
+                project.save()
+
+
+            committee.is_finalized = True
+            committee.save()
+            return Response ({
+                "message":"تم اعتماد النتيجة وارسالها للطلاب بنجاح ✅",
+                "final_grade":avg_grade}
+                ,status=status.HTTP_200_OK)
+    
+
+# واجهة خاصة برئيس القسم لعرض قائمة بجميع المشاريع (عنوان، وصف، حالة، طلاب)
+class HeadProjectView(generics.ListAPIView):
+    serializer_class = ProjectSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    def get_queryset(self):
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        return Project.objects.all()
+    
+# إعدادات النظام (لرئيس القسم)
+# GET: عرض الإعدادات الحالية (الحد الأقصى للطلاب لكل مشروع)
+# PUT: تعديل الإعدادات
+class SystemSettingsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        # جلب إعدادات النظام (الحد الأقصى للطلاب لكل مشروع)
+        if not request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        settings = SystemSettings.objects.first()
+        if not settings:
+            settings = SystemSettings.objects.create()
+        serializer = SystemSettingsSerializer(settings)
+        return Response(serializer.data)
+
+    def put(self, request):
+        # تعديل إعدادات النظام (الحد الأقصى للطلاب لكل مشروع)
+        if not request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        settings = SystemSettings.objects.first()
+        if not settings:
+            settings = SystemSettings.objects.create()
+        serializer = SystemSettingsSerializer(settings, data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# تفاصيل مشروع محدد (لرئيس القسم)
+# يعرض: المشرف، الطلاب، التقارير المطلوبة/المقبولة، نسبة التقدم %، الدرجة النهائية
+class HeadProjectDetailsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, project_id):
+        # جلب تفاصيل مشروع معين بواسطة id
+
+        if not request.user.is_superuser:
+            raise PermissionDenied(
+                "هذه الصلاحية لرئيس القسم فقط"
+            )
+
+        project = get_object_or_404(Project, id=project_id)
+
+        accepted_reports = project.reports.filter(
+            status='accepted'
+        ).count()
+
+        reports_count = project.reports.count()
+
+        if project.required_reports == 0:
+            progress = 0
+        else:
+            progress = min((
+                accepted_reports /
+                project.required_reports
+            ) * 100 , 100)
+
+        return Response({
+            "id": project.id,
+            "title": project.title,
+            "description": project.description,
+            "status": project.status,
+
+            "supervisor":
+                project.supervisor.username
+                if project.supervisor else None,
+
+            "students": [
+                student.username
+                for student in project.students.all()
+            ],
+
+            "required_reports":
+                project.required_reports,
+
+            "reports_count":
+                reports_count,
+
+            "accepted_reports":
+                accepted_reports,
+
+            "progress":
+                round(progress, 2),
+  
+            "final_grade":
+                project.final_grade
+        })
+     
+
+
+# إدارة الأقسام (لرئيس القسم)
+# عرض/إضافة/تعديل/حذف الأقسام (قيد التطوير - مستخدم حالياً؟)
+class DepartmentViewSet(viewsets.ModelViewSet):
+    queryset = Department.objects.all()
+    serializer_class = DepartmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        # إضافة قسم جديد (فقط لرئيس القسم)
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        # تعديل قسم موجود (فقط لرئيس القسم)
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        # حذف قسم (فقط لرئيس القسم)
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("هذه الصلاحية لرئيس القسم فقط")
+        instance.delete()
+

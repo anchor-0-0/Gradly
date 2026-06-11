@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Database
+db.sqlite3
+*.sqlite3
+
+# Environment
+.env
+
+# Media
+media/reports/*
+!media/reports/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
