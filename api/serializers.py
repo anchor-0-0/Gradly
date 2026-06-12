@@ -61,12 +61,24 @@ class ResetPasswordSerializer(serializers.Serializer):
 
 class ProjectSerializer(serializers.ModelSerializer):
     students = serializers.StringRelatedField(many = True,read_only=True,allow_null=True)
-    supervisor_name = serializers.ReadOnlyField(source='supervisor.username', default=None)
+    supervisor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
         fields = ['id', 'title', 'description', 'status', 'students', 'required_reports',
                   'objectives', 'technologies', 'deliverables', 'final_grade', 'supervisor', 'supervisor_name']
+        
+    # 2. هذه الدالة تقوم بفحص إذا كان الطالب منضم للمشروع أم لا لإخفاء الاسم أو إظهاره
+    def get_supervisor_name(self, obj):
+        request = self.context.get('request')
+        if request and request.user:
+            # إذا كان الطالب الحالي مسجل بداخل قائمة طلاب هذا المشروع
+            if request.user in obj.students.all():
+               
+                return obj.supervisor.username
+        
+        # إذا لم يكن الطالب منضماً بعد، يظهر هذا النص المخفي
+        return "مخفي حتى الانضمام"
 
 class ReportSerializer(serializers.ModelSerializer):
     class Meta:

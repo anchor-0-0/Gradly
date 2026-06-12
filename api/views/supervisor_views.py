@@ -392,6 +392,7 @@ class AnnouncementDetailWithAttendanceView(APIView):
 
         base_data = {
             "id": announcement.id,
+            "title": announcement.title,
             "content": announcement.content,
             "meeting_time": announcement.meeting_time,
             "created_at": announcement.created_at,
