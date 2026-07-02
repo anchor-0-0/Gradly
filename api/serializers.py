@@ -1,35 +1,44 @@
 from rest_framework import serializers
-from django.contrib.auth.models import User
+from django.contrib.auth.models import User, Group
 from .models import Notification, Project, Report , Announcement ,Attendance ,DefenseCommittee , Evaluation, SystemSettings, JoinRequest, PasswordResetCode
 from .models import Department,UserProfile
 from django.utils import timezone
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True ,required =True)
-    
+    password = serializers.CharField(write_only=True, required=True)
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=True,
+        write_only=True,
+    )
 
     class Meta:
         model = User
-        fields = ('username','password', 'email', 'first_name','last_name')
+        fields = ('username', 'password', 'email', 'first_name', 'last_name', 'department')
 
-
-    #حتى ما ينهار النظام اذا عملت تسجيل دخول مرتين بنفس الايميل
     def validate_email(self, value):
         if User.objects.filter(email=value).exists():
             raise serializers.ValidationError("هذا الحساب موجود بالفعل، جرب تسجيل الدخول.")
         return value
-    
-
 
     def create(self, validated_data):
+        department = validated_data.pop('department', None)
         user = User.objects.create_user(
-            username=validated_data['email'], # نستخدم الإيميل كاسم مستخدم
+            username=validated_data['email'],
             email=validated_data['email'],
             password=validated_data['password'],
             first_name=validated_data.get('first_name', ''),
-            last_name=validated_data.get('last_name','')
+            last_name=validated_data.get('last_name', ''),
         )
+        try:
+            user.groups.add(Group.objects.get(name='Student'))
+        except Group.DoesNotExist:
+            pass
+        if department:
+            profile, _ = UserProfile.objects.get_or_create(user=user)
+            profile.department = department
+            profile.save()
         return user
 
 # -- سيرياليزر خاص بطلب إعادة تعيين كلمة المرور (التحقق من صحة الإيميل) --
@@ -62,28 +71,46 @@ class ResetPasswordSerializer(serializers.Serializer):
 class ProjectSerializer(serializers.ModelSerializer):
     students = serializers.StringRelatedField(many = True,read_only=True,allow_null=True)
     supervisor_name = serializers.SerializerMethodField()
-
+    department_name = serializers.SerializerMethodField()
+    max_students_per_project = serializers.SerializerMethodField()
     class Meta:
         model = Project
         fields = ['id', 'title', 'description', 'status', 'students', 'required_reports',
-                  'objectives', 'technologies', 'deliverables', 'final_grade', 'supervisor', 'supervisor_name']
+                  'objectives', 'technologies', 'deliverables', 'final_grade', 'supervisor',
+                  'supervisor_name', 'department', 'department_name', 'max_students_per_project']
+        read_only_fields = ['department']
         
-    # 2. هذه الدالة تقوم بفحص إذا كان الطالب منضم للمشروع أم لا لإخفاء الاسم أو إظهاره
+    # إظهار اسم المشرف للطلاب المنضمين ولجميع المشرفين/رؤساء القسم/العمداء
     def get_supervisor_name(self, obj):
         request = self.context.get('request')
         if request and request.user:
-            # إذا كان الطالب الحالي مسجل بداخل قائمة طلاب هذا المشروع
-            if request.user in obj.students.all():
-               
-                return obj.supervisor.username
-        
-        # إذا لم يكن الطالب منضماً بعد، يظهر هذا النص المخفي
-        return "مخفي حتى الانضمام"
+            if request.user.is_staff or request.user.is_superuser or obj.students.filter(id=request.user.id).exists():
+                if obj.supervisor:
+                    name = f"{obj.supervisor.first_name} {obj.supervisor.last_name}".strip()
+                    return name if name else obj.supervisor.username
+                return None
+        return None
+    
+    # إظهار اسم القسم
+    def get_department_name(self, obj):
+        return obj.department.name if obj.department else None
+
+    def get_max_students_per_project(self, obj):
+        from .models import SystemSettings
+        settings = SystemSettings.objects.first()
+        return settings.max_students_per_project if settings else 5
 
 class ReportSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+
     class Meta:
         model = Report
-        fields = ['id', 'file_title', 'file', 'status', 'feedback', 'student', 'project']
+        fields = ['id', 'file_title', 'file', 'status', 'feedback', 'student', 'project', 'student_name']
+
+    def get_student_name(self, obj):
+        if obj.student:
+            return obj.student.get_full_name() or obj.student.username
+        return None
 
     def __init__(self, *args, **kwargs):
         super(ReportSerializer, self).__init__(*args, **kwargs)
@@ -128,11 +155,23 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
 
 class JoinRequestSerializer(serializers.ModelSerializer):
-    student_name = serializers.ReadOnlyField(source='student.username')
     project_title = serializers.ReadOnlyField(source='project.title')
+    students = serializers.SerializerMethodField()
+
     class Meta:
         model = JoinRequest
-        fields = ['id', 'project', 'project_title', 'student', 'student_name', 'status', 'created_at']
+        fields = ['id', 'project', 'project_title', 'students', 'status', 'created_at']
+
+    def get_students(self, obj):
+        return [
+            {
+                'id': s.id,
+                'username': s.username,
+                'email': s.email,
+                'full_name': f"{s.first_name} {s.last_name}".strip() or s.username,
+            }
+            for s in obj.students.all()
+        ]
 
 
 class DefenseCommitteeSerializer(serializers.ModelSerializer):
@@ -143,7 +182,11 @@ class DefenseCommitteeSerializer(serializers.ModelSerializer):
         fields = ['id' , 'project' , 'project_name' , 'examiners' , 'examiners_names' , 'date' , 'location' , 'is_finalized']
 
     def get_examiners_names(self, obj):
-        return [e.username for e in obj.examiners.all()]
+        names = []
+        for e in obj.examiners.all():
+            name = f"{e.first_name} {e.last_name}".strip()
+            names.append(name if name else e.username)
+        return names
 
 
 class EvaluationSerializer(serializers.ModelSerializer):
@@ -158,33 +201,52 @@ class EvaluationSerializer(serializers.ModelSerializer):
 class SystemSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = SystemSettings
-        fields = ['id', 'max_students_per_project']
+        fields = ['id', 'max_students_per_project', 'department']
 
 
 class DepartmentSerializer(serializers.ModelSerializer):
-    head_name = serializers.ReadOnlyField(source='head.username', default=None)
+    head_name = serializers.SerializerMethodField()
     members_count = serializers.SerializerMethodField()
     class Meta:
         model = Department
-        fields = ['id', 'name', 'code', 'description', 'head', 'head_name', 'members_count']
+        fields = ['id', 'name', 'code', 'head', 'head_name', 'members_count']
+
+    def get_head_name(self, obj):
+        if obj.head:
+            name = f"{obj.head.first_name} {obj.head.last_name}".strip()
+            return name if name else obj.head.username
+        return None
 
     def get_members_count(self, obj):
         return obj.members.count()
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
+    department = serializers.SerializerMethodField()
     class Meta:
         model = UserProfile
         fields = ['id', 'department', 'phone', 'address', 'birth_date']
+
+    def get_department(self, obj):
+        if obj.department:
+            return {'id': obj.department.id, 'name': obj.department.name, 'code': obj.department.code}
+        return None
 
 
 class UserManagementSerializer(serializers.ModelSerializer):
     profile = UserProfileSerializer(read_only=True)
     is_supervisor = serializers.ReadOnlyField(source='is_staff')
+    department = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'is_staff', 'is_superuser', 'is_active', 'profile', 'is_supervisor']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'is_staff', 'is_superuser', 'is_active', 'profile', 'is_supervisor', 'department']
+
+    def get_department(self, obj):
+        profile = getattr(obj, 'profile', None)
+        if profile and profile.department:
+            return {'id': profile.department.id, 'name': profile.department.name, 'code': profile.department.code}
+        return None
 
 
 class AnnouncementListSerializer(serializers.ModelSerializer):

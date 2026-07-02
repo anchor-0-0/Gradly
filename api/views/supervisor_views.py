@@ -17,12 +17,8 @@ class ApproveJoinRequestView(APIView):
 
         join_request = get_object_or_404(JoinRequest, id=request_id)
         project = join_request.project
-        # تأكد أنه المشرف نفسه
         if request.user != project.supervisor:
             return Response({"error" : "غير مسموح لك باتخاذ هذا الإجراء❌"} , status=status.HTTP_403_FORBIDDEN)
-
-        if join_request.student in project.students.all():
-            return Response({"error":"مضاف مسبقاً"}, status=status.HTTP_400_BAD_REQUEST)
 
         if join_request.status != 'pending':
             return Response({"error":"تم معالجة الطلب مسبقاً"}, status=status.HTTP_400_BAD_REQUEST)
@@ -30,26 +26,20 @@ class ApproveJoinRequestView(APIView):
         settings = SystemSettings.objects.first()
         if not settings:
             return Response({"error" : "إعدادات النظام غير مهيأة بعد"} , status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        if project.students.count() >= settings.max_students_per_project:
+        if project.students.count() + join_request.students.count() > settings.max_students_per_project:
             return Response({"error": "لا يمكن إضافة هذا العدد، سيتجاوز الحد الأقصى للمشروع ❌"}, status=status.HTTP_400_BAD_REQUEST)
-        
-    
 
-        # قبول الطلب
         join_request.status = "approved"
         join_request.save()
 
-        # إضافة الطالب للمشروع
-        project.students.add(join_request.student)
+        for student in join_request.students.all():
+            project.students.add(student)
+            Notification.objects.create(
+                recipient=student,
+                project=project,
+                message=f"تم قبولك في مشروع {project.title} 🎉"
+            )
 
-        # إشعار للطالب
-        Notification.objects.create(
-            recipient=join_request.student,
-            project=project,
-            message=f"تم قبولك في مشروع {project.title} 🎉"
-        )
-
-        # تحديث الحالة إذا اكتمل الفريق
         if project.students.count() >= settings.max_students_per_project:
             project.status = "in_progress"
             project.save()
@@ -73,11 +63,12 @@ class RejectJoinRequestView(APIView):
         join_request.status = 'rejected'
         join_request.save()
 
-        Notification.objects.create(
-            recipient=join_request.student,
-            project=join_request.project,
-            message=f"عذراً، تم رفض انضمامك لمشروع {join_request.project.title}"
-        )
+        for student in join_request.students.all():
+            Notification.objects.create(
+                recipient=student,
+                project=join_request.project,
+                message=f"عذراً، تم رفض انضمامك لمشروع {join_request.project.title}"
+            )
 
         return Response({"message": "تم رفض الطلب"})
 
@@ -93,7 +84,8 @@ class SupervisorCreateProject(generics.CreateAPIView):
     def perform_create(self, serializer):
         if not self.request.user.is_staff:
             raise PermissionDenied("هذه الصلاحية للمشرفين فقط")
-        serializer.save(supervisor = self.request.user , status = 'proposed')
+        dept = getattr(getattr(self.request.user, 'profile', None), 'department', None)
+        serializer.save(supervisor=self.request.user, status='proposed', department=dept)
        
 
 # إدارة المشاريع (تعديل/حذف) - المشرف فقط
@@ -211,7 +203,8 @@ class SupervisorDashboardView(APIView):
     def get (self , request):
         user = request.user
         projects = Project.objects.filter(supervisor=user)
-        project_count = projects.count()
+        active_projects = projects.exclude(status='proposed')
+        project_count = active_projects.count()
         students_count = User.objects.filter(student_projects__supervisor=user).distinct().count()
         pending_reports = Report.objects.filter(project__supervisor=user, status='pending').count()
 
@@ -232,7 +225,7 @@ class SupervisorDashboardView(APIView):
             for r in recent_reports
         ]
 
-        # قائمة المشاريع مع عدد الطلاب
+        # قائمة المشاريع النشطة مع عدد الطلاب
         my_projects = [
             {
                 'id': p.id,
@@ -240,7 +233,7 @@ class SupervisorDashboardView(APIView):
                 'status': p.status,
                 'team_count': p.students.count(),
             }
-            for p in projects
+            for p in active_projects
         ]
 
         return Response({
@@ -269,8 +262,11 @@ class EvaluationViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser:
-            return Evaluation.objects.all()
+        if user.groups.filter(name='HOD').exists() or user.is_superuser:
+            dept = getattr(getattr(user, 'profile', None), 'department', None)
+            if dept:
+                return Evaluation.objects.filter(committee__project__department=dept)
+            return Evaluation.objects.none()
         if user.is_staff:
             # المشرف يشوف تقييمات لجنة مشروعه فقط
             return Evaluation.objects.filter(committee__project__supervisor=user)
@@ -314,7 +310,12 @@ class SupervisorProjectDetails(APIView):
         )
 
         students = [
-            s.username
+            {
+                "id": s.id,
+                "username": s.username,
+                "email": s.email,
+                "full_name": f"{s.first_name} {s.last_name}".strip() or s.username,
+            }
             for s in project.students.all()
         ]
 
@@ -339,15 +340,21 @@ class SupervisorProjectDetails(APIView):
         attendance_rate = min(float(avg_val)*100 , 100)
 
         return Response({
+            "id": project.id,
             "title": project.title,
             "description": project.description,
             "status": project.status,
             "students": students,
+            "supervisor_name": project.supervisor.username,
             "progress": round(progress, 2),
             "reports_count": project.reports.count(),
             "accepted_reports": accepted_reports,
             "announcements_count": project.announcements.count(),
-            "attendance_rate": round(attendance_rate, 2)
+            "attendance_rate": round(attendance_rate, 2),
+            "technologies": project.technologies or [],
+            "objectives": project.objectives or [],
+            "deliverables": project.deliverables or [],
+            "final_grade": project.final_grade,
         })
     
 

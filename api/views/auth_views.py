@@ -1,4 +1,4 @@
-import uuid
+import random
 from django.utils import timezone
 from datetime import timedelta
 from rest_framework import generics, permissions, status
@@ -54,8 +54,8 @@ class ForgotPasswordView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         email = serializer.validated_data['email']
-        # إنشاء رمز فريد لإعادة التعيين
-        code = str(uuid.uuid4())
+        # إنشاء رمز من 6 أرقام لإعادة التعيين
+        code = f'{random.randint(0, 999999):06d}'
         PasswordResetCode.objects.create(email=email, code=code)
 
         return Response({
@@ -80,9 +80,12 @@ class ResetPasswordView(APIView):
         new_password = serializer.validated_data['new_password']
 
         # جلب رمز التحقق والتأكد من صلاحيته (لم يمضِ عليه أكثر من ساعة)
-        reset_code = PasswordResetCode.objects.get(
-            email=email, code=code, is_used=False
-        )
+        try:
+            reset_code = PasswordResetCode.objects.get(
+                email=email, code=code, is_used=False
+            )
+        except PasswordResetCode.DoesNotExist:
+            return Response({'error': 'رمز التحقق غير صالح'}, status=status.HTTP_400_BAD_REQUEST)
         if reset_code.created_at < timezone.now() - timedelta(hours=1):
             return Response({'error': 'انتهت صلاحية الرمز، يرجى طلب رمز جديد'},
                             status=status.HTTP_400_BAD_REQUEST)

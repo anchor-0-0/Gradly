@@ -47,11 +47,18 @@ class Project(models.Model):
     technologies = models.TextField(blank=True, verbose_name="التقنيات المستخدمة")
     deliverables = models.TextField(blank=True, verbose_name="مخرجات المشروع")
 
+    # القسم (جديد)
+    department = models.ForeignKey(
+        'Department', 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True, 
+        related_name='projects',
+        verbose_name="القسم"
+    )
+
     def __str__(self):
         return self.title
-
-   
-        
 
 # جدول التقارير
 class Report(models.Model):
@@ -114,6 +121,7 @@ class Notification(models.Model):
 
   
 
+
 #جدول الإعلانات
 class Announcement(models.Model):
     project = models.ForeignKey(Project , on_delete=models.CASCADE ,related_name='announcements')
@@ -125,7 +133,6 @@ class Announcement(models.Model):
     def __str__(self):
         return f"Annoucement for {self.project.title} at {self.meeting_time}"
     
-
 
 
 #جدول الحضور والغياب 
@@ -170,14 +177,15 @@ class Evaluation (models.Model):
 
 # جدول خاص باعدادات النظام يسمح لرئيس اقسم بتحديد عدد اعضاء الفريق للمشروع الواحد
 class SystemSettings(models.Model):
+    department = models.OneToOneField('Department', on_delete=models.CASCADE, null=True, blank=True, related_name='settings')
     max_students_per_project = models.PositiveBigIntegerField(default=5)
     def __str__(self):
-        return "System Settings"
+        return f"Settings - {self.department.name if self.department else 'Global'}"
     
 # جدول طلب انضمام الطالب لمشروع
 class JoinRequest(models.Model):
     project = models.ForeignKey(Project, on_delete=models.CASCADE)
-    student = models.ForeignKey(User, on_delete=models.CASCADE)
+    students = models.ManyToManyField(User, related_name='join_requests')
 
     status = models.CharField(max_length = 20 ,
     choices = [
@@ -190,7 +198,7 @@ class JoinRequest(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     class Meta:
-        unique_together = ('project' , 'student')
+        unique_together = ('project',)
 
 
 # جدول الأقسام

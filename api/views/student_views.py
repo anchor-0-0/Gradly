@@ -5,10 +5,10 @@ from rest_framework.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
 from django.db.models import Avg, Q
-from ..models import Project, Report, Notification, JoinRequest, Attendance, DefenseCommittee, UserProfile, SystemSettings
+from ..models import Project, Report, Notification, JoinRequest, Attendance, DefenseCommittee, UserProfile, SystemSettings, Department
 from ..serializers import (
     ProjectSerializer, ReportSerializer, NotificationSerializer,
-    JoinRequestSerializer, AnnouncementListSerializer
+    DepartmentSerializer,
 )
 
 
@@ -28,7 +28,11 @@ class ProjectListView(generics.ListAPIView):
         if user.is_staff:
             queryset = Project.objects.filter(supervisor=user)
         else:
-            queryset = Project.objects.filter(status='proposed')
+            dept = getattr(getattr(user, 'profile', None), 'department', None)
+            if dept:
+                queryset = Project.objects.filter(status='proposed', department=dept)
+            else:
+                queryset = Project.objects.none()
 
         # البحث حسب الكلمة المفتاحية
         search = self.request.query_params.get('search')
@@ -65,41 +69,49 @@ class JoinProjectView(APIView):
 
     def post(self, request, id):
         project = get_object_or_404(Project, id=id)
+        student_dept = getattr(getattr(request.user, 'profile', None), 'department', None)
+        if student_dept and project.department != student_dept:
+            return Response({'error': 'هذا المشروع ليس من قسمك'}, status=status.HTTP_403_FORBIDDEN)
         if request.user.is_staff:
             return Response({'error': 'المشرفين لا يمكنهم الانضمام للمشاريع'}, status=status.HTTP_403_FORBIDDEN)
         emails = request.data.get('emails', [])
-        # إذا القائمة فاضية، منرجع خطأ
         if not emails:
             return Response({"error": "يرجى إرسال قائمة بإيميلات أعضاء الفريق 📩"}, status=status.HTTP_400_BAD_REQUEST)
         if request.user.email not in emails:
             emails.append(request.user.email)
         emails = list(set(emails))
 
-        # التحقق من وجود إعدادات النظام والسعة المتوفرة
         settings = SystemSettings.objects.first()
         if not settings:
             return Response({"error": "إعدادات النظام غير مهيأة"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         if project.students.count() + len(emails) > settings.max_students_per_project:
             return Response({"error": f"لا يمكن إضافة هذا العدد، الحد الأقصى {settings.max_students_per_project} طالب"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # التحقق من وجود مشرف للمشروع (لأنه قد يكون null)
         if not project.supervisor:
             return Response({"error": "المشروع ليس له مشرف حالياً، لا يمكن تقديم طلب"}, status=status.HTTP_400_BAD_REQUEST)
 
+        existing_pending = JoinRequest.objects.filter(project=project, status='pending').first()
+        if existing_pending:
+            return Response({"error": "يوجد طلب انضمام معلق بالفعل لهذا المشروع"}, status=status.HTTP_400_BAD_REQUEST)
+
+        students_to_add = []
         for email in emails:
             try:
                 student_user = User.objects.get(email=email)
                 if student_user.student_projects.exists():
                     return Response({"error": f"هذا الحساب {email} بالفعل مسجل في مشروع آخر"}, status=status.HTTP_400_BAD_REQUEST)
-                if JoinRequest.objects.filter(project=project, student=student_user).exists():
-                    continue
                 if project.students.filter(id=student_user.id).exists():
                     continue
-                JoinRequest.objects.create(project=project, student=student_user)
+                students_to_add.append(student_user)
             except User.DoesNotExist:
                 return Response({"error": f"الإيميل {email} غير موجود في النظام"}, status=status.HTTP_404_NOT_FOUND)
 
-        # إرسال إشعار واحد للمشرف بعد معالجة جميع الطلبات
+        if not students_to_add:
+            return Response({"error": "جميع الطلاب مسجلين بالفعل في هذا المشروع"}, status=status.HTTP_400_BAD_REQUEST)
+
+        join_request = JoinRequest.objects.create(project=project)
+        join_request.students.set(students_to_add)
+
         Notification.objects.create(
             recipient=project.supervisor,
             project=project,
@@ -108,6 +120,46 @@ class JoinProjectView(APIView):
 
         return Response({"message": "تم إرسال طلب الانضمام للمشرف"}, status=status.HTTP_200_OK)
     
+
+
+# التحقق من صحة بريد الطالب قبل الإضافة
+# POST /api/validate-email/
+class ValidateEmailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip()
+        if not email:
+            return Response({'error': 'البريد الإلكتروني مطلوب'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({'error': 'الحساب غير موجود في النظام'}, status=status.HTTP_404_NOT_FOUND)
+
+        if user.id == request.user.id:
+            return Response({'error': 'لا يمكنك إضافة بريدك الخاص، أنت قائد الفريق'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user.is_staff:
+            return Response({'error': 'هذا الحساب مشرف ولا يمكن إضافته كطالب'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user.student_projects.exists():
+            return Response({'error': 'هذا الطالب منضم لمشروع آخر'}, status=status.HTTP_400_BAD_REQUEST)
+
+        full_name = ''
+        profile = getattr(user, 'profile', None)
+        if profile:
+            full_name = f'{getattr(profile, "first_name", "")} {getattr(profile, "last_name", "")}'.strip()
+        if not full_name:
+            full_name = f'{user.first_name} {user.last_name}'.strip()
+        if not full_name:
+            full_name = user.username
+
+        return Response({
+            'id': user.id,
+            'email': user.email,
+            'full_name': full_name,
+        }, status=status.HTTP_200_OK)
 
 
 # رفع تقرير جديد (للطالب)
@@ -144,6 +196,8 @@ class MyReportsView(generics.ListAPIView):
 
 # إشعارات المستخدم
 # GET /my-notifications/
+# PATCH /my-notifications/<id>/ — تعليم كمقروء
+# PATCH /my-notifications/ — تعليم الكل كمقروء
 class MyNotificationsView(generics.ListAPIView):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -151,10 +205,23 @@ class MyNotificationsView(generics.ListAPIView):
     def get_queryset(self):
         return Notification.objects.filter(recipient=self.request.user).order_by('-created_at')
 
+    def patch(self, request, *args, **kwargs):
+        pk = kwargs.get('pk')
+        if pk:
+            notification = Notification.objects.filter(id=pk, recipient=request.user).first()
+            if not notification:
+                return Response({'error': 'الإشعار غير موجود'}, status=status.HTTP_404_NOT_FOUND)
+            notification.is_read = True
+            notification.save()
+            return Response({'status': 'ok'})
+        else:
+            Notification.objects.filter(recipient=request.user, is_read=False).update(is_read=True)
+            return Response({'status': 'ok'})
+
 
 # الشاشة الرئيسية للطالب (داشبورد)
 # GET /student/project_dashboard/
-# يعرض: المشروع + شريط التقدم + التقارير المقبولة
+# يعرض: المشروع + شريط التقدم + التقارير المقبولة + أعضاء الفريق
 class StudentProjectDashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -167,7 +234,19 @@ class StudentProjectDashboardView(APIView):
             progress = 0
         else:
             progress = min((accepted_reports / project.required_reports) * 100, 100)
+
+        team_members = [
+            {
+                'id': s.id,
+                'name': s.get_full_name() or s.username,
+                'username': s.username,
+                'email': s.email,
+            }
+            for s in project.students.exclude(id=request.user.id).order_by('id')
+        ]
+
         return Response({
+            'project_id': project.id,
             'project_title': project.title,
             'project_description': project.description,
             'status': project.status,
@@ -175,7 +254,9 @@ class StudentProjectDashboardView(APIView):
             'total_reports': project.reports.count(),
             'required_reports': project.required_reports,
             'progress': round(progress, 2),
-            'supervisor': project.supervisor.username if project.supervisor else None,
+            'supervisor': project.supervisor.get_full_name() or project.supervisor.username if project.supervisor else None,
+            'team_members': team_members,
+            'team_count': project.students.count(),
         })
 
 
@@ -243,12 +324,41 @@ class StudentMyCommitteeView(APIView):
             committee = DefenseCommittee.objects.get(project=project)
         except DefenseCommittee.DoesNotExist:
             return Response({'error': 'لم يتم تحديد لجنة مناقشة بعد'}, status=status.HTTP_404_NOT_FOUND)
+
+        examiners = []
+        for ex in committee.examiners.all():
+            profile = getattr(ex, 'profile', None)
+            examiners.append({
+                'id': ex.id,
+                'username': ex.username,
+                'full_name': ex.get_full_name() or ex.username,
+                'email': ex.email,
+                'department': profile.department.name if profile and profile.department else None,
+            })
+
+        evaluations = []
+        total_grade = None
+        if committee.is_finalized:
+            evals = committee.evaluations.all()
+            grades = []
+            for ev in evals:
+                evaluations.append({
+                    'doctor_name': ev.doctor.get_full_name() or ev.doctor.username,
+                    'grade': ev.grade,
+                    'feedback': ev.feedback,
+                })
+                grades.append(ev.grade)
+            if grades:
+                total_grade = round(sum(grades) / len(grades), 2)
+
         return Response({
             'project_title': project.title,
             'date': committee.date,
             'location': committee.location,
-            'examiners': [e.username for e in committee.examiners.all()],
+            'examiners': examiners,
             'is_finalized': committee.is_finalized,
+            'evaluations': evaluations,
+            'total_grade': total_grade,
         })
 
 
@@ -289,6 +399,9 @@ class StudentProjectDetailView(APIView):
         total_required = project.required_reports
         progress = min((accepted / total_required) * 100, 100) if total_required > 0 else 0
 
+        settings = SystemSettings.objects.first()
+        max_students = settings.max_students_per_project if settings else 5
+
         return Response({
             'id': project.id,
             'title': project.title,
@@ -298,7 +411,8 @@ class StudentProjectDetailView(APIView):
             'deliverables': project.deliverables,
             'status': project.status,
             'supervisor': project.supervisor.username if project.supervisor else None,
-            'available_seats': max(0, (SystemSettings.objects.first().max_students_per_project if SystemSettings.objects.first() else 5) - project.students.count()),
+            'max_students_per_project': max_students,
+            'available_seats': max(0, max_students - project.students.count()),
             'students': [s.username for s in project.students.all()],
             'accepted_reports': accepted,
             'required_reports': total_required,
@@ -316,10 +430,25 @@ class StudentPendingRequestView(APIView):
         if request.user.is_staff:
             return Response({'error': 'المشرفون لا يمكنهم تقديم طلبات انضمام'}, status=status.HTTP_403_FORBIDDEN)
         pending_requests = JoinRequest.objects.filter(
-            student=request.user
+            students=request.user
         ).order_by('-created_at')
         serializer = JoinRequestSerializer(pending_requests, many=True)
         return Response(serializer.data)
+
+
+# DELETE /api/student/pending-request/cancel/
+# إلغاء طلب انضمام معلّق
+class StudentCancelPendingRequestView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request):
+        pending = JoinRequest.objects.filter(
+            students=request.user, status='pending'
+        ).first()
+        if not pending:
+            return Response({'error': 'لا يوجد طلب معلّق لإلغائه'}, status=status.HTTP_404_NOT_FOUND)
+        pending.delete()
+        return Response({'message': 'تم إلغاء الطلب بنجاح'}, status=status.HTTP_200_OK)
 
 
 # -- عرض تفاصيل تقرير محدّد للطالب (شاشة Report Details #12) --
@@ -345,6 +474,8 @@ class StudentReportDetailView(APIView):
             'feedback': report.feedback,
             'uploaded_at': report.uploaded_at,
             'student': report.student.username if report.student else None,
+            'student_name': (report.student.get_full_name() or report.student.username) if report.student else None,
+            'student_id': report.student.id if report.student else None,
             'project_title': project.title,
         })
 
@@ -359,12 +490,16 @@ class ProfileView(APIView):
     def get(self, request):
         user = request.user
         profile = getattr(user, 'profile', None)
+        groups = list(user.groups.values_list('name', flat=True))
         return Response({
+            'id': user.id,
             'username': user.username,
             'email': user.email,
             'first_name': user.first_name,
             'last_name': user.last_name,
             'is_staff': user.is_staff,
+            'is_superuser': user.is_superuser,
+            'groups': groups,
             'department': profile.department.name if profile and profile.department else None,
             'phone': profile.phone if profile else '',
         })
@@ -382,3 +517,11 @@ class ProfileView(APIView):
             profile.address = request.data['address']
         profile.save()
         return Response({'message': 'تم تحديث الملف الشخصي'})
+
+
+# قائمة الأقسام (عامة — بدون مصادقة) لصفحة التسجيل
+# GET /api/departments/public/
+class PublicDepartmentListView(generics.ListAPIView):
+    queryset = Department.objects.all()
+    serializer_class = DepartmentSerializer
+    permission_classes = [permissions.AllowAny]

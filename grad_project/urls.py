@@ -11,6 +11,7 @@ from api.views.student_views import (
     StudentFinalResultView, StudentAnnouncementsView, StudentAttendanceView,
     StudentMyCommitteeView, StudentAttendanceSummaryView, ProfileView,
     StudentProjectDetailView, StudentPendingRequestView, StudentReportDetailView,
+    StudentCancelPendingRequestView, PublicDepartmentListView, ValidateEmailView,
 )
 from api.views.supervisor_views import (
     ApproveJoinRequestView, RejectJoinRequestView,
@@ -26,7 +27,7 @@ from api.views.head_views import (
     HeadProjectDetailsView, DepartmentViewSet,
     HODDashboardView, HODNotificationsView,
 )
-from api.views.admin_views import AdminDashboardView, AdminUserListView, AdminUserDetailView, AdminCreateUserView
+from api.views.admin_views import AdminDashboardView, AdminUserListView, AdminUserDetailView, AdminCreateUserView, AdminDepartmentListView, AdminCreateDepartmentView, AdminDepartmentDetailView
 
 router = DefaultRouter()
 router.register(r'committees', DefenseCommitteeViewSet)
@@ -34,7 +35,6 @@ router.register(r'evaluation', EvaluationViewSet)
 router.register(r'departments', DepartmentViewSet)
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
     # Auth
     path('api/register/', RegisterView.as_view(), name='register'),
     path('api/login/', LoginView.as_view(), name='login'),
@@ -44,9 +44,11 @@ urlpatterns = [
     path('api/projects/', ProjectListView.as_view(), name='project-list'),
     path('api/projects/<int:id>/details/', StudentProjectDetailView.as_view(), name='project-details-student'),
     path('api/projects/<int:id>/join/', JoinProjectView.as_view(), name='join-project'),
+    path('api/validate-email/', ValidateEmailView.as_view(), name='validate-email'),
     path('api/reports/upload/', UploadReportView.as_view(), name='upload-report'),
     path('api/reports/<int:id>/', StudentReportDetailView.as_view(), name='report-detail'),
     path('api/student/pending-request/', StudentPendingRequestView.as_view(), name='student-pending-request'),
+    path('api/student/pending-request/cancel/', StudentCancelPendingRequestView.as_view(), name='student-cancel-pending-request'),
     path('api/student/final_result/', StudentFinalResultView.as_view(), name='student-final-result'),
     path('api/student/announcements/', StudentAnnouncementsView.as_view(), name='student-announcements'),
     path('api/student/attendance/<int:project_id>/', StudentAttendanceView.as_view(), name='student-attendance'),
@@ -72,16 +74,24 @@ urlpatterns = [
     path('api/projects/<int:project_id>/attendance-sessions/', SupervisorAttendanceSessionsView.as_view(), name='supervisor-attendance-sessions'),
     path('my-reports/', MyReportsView.as_view(), name='my-reports'),
     path('my-notifications/', MyNotificationsView.as_view(), name='my-notifications'),
+    path('my-notifications/<int:pk>/', MyNotificationsView.as_view(), name='my-notification-detail'),
     path('join_requests/pending/', PendingJoinRequestsView.as_view(), name='pending-join-requests'),
     # Head
     path('head/dashboard/', HODDashboardView.as_view(), name='hod-dashboard'),
     path('head/notifications/', HODNotificationsView.as_view(), name='hod-notifications'),
     path('head/projects/', HeadProjectView.as_view(), name='head-projects'),
     path('head/projects/<int:project_id>/', HeadProjectDetailsView.as_view(), name='head-project-details'),
-    # Admin
+    # Public departments (for registration)
+    path('api/departments/public/', PublicDepartmentListView.as_view(), name='public-departments'),
+    # Admin (must be before Django admin site to avoid path conflict)
     path('admin/users/', AdminUserListView.as_view(), name='admin-users'),
     path('admin/users/create/', AdminCreateUserView.as_view(), name='admin-create-user'),
     path('admin/users/<int:pk>/', AdminUserDetailView.as_view(), name='admin-user-detail'),
+    path('admin/departments/', AdminDepartmentListView.as_view(), name='admin-departments'),
+    path('admin/departments/create/', AdminCreateDepartmentView.as_view(), name='admin-create-department'),
+    path('admin/departments/<int:pk>/', AdminDepartmentDetailView.as_view(), name='admin-department-detail'),
+    # Django admin (last — its /admin/ prefix would swallow custom admin/ routes if placed above)
+    path('admin/', admin.site.urls),
     # Router
     path('', include(router.urls)),
 ]
